@@ -5,9 +5,11 @@ pydantic
 python-dotenv
 google-generativeai
 langchain
+langchain-google-genai
 langchain-community
 langchain-huggingface
 PyPDF2
 faiss-cpu
 streamlit
 tenacity
+sentence-transformers
