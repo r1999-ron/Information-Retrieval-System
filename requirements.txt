@@ -1,7 +1,13 @@
+fastapi
+uvicorn
+sqlalchemy
+pydantic
 python-dotenv
 google-generativeai
 langchain
+langchain-community
+langchain-huggingface
 PyPDF2
 faiss-cpu
 streamlit
--e .
+tenacity
