@@ -2,7 +2,10 @@ import os
 import shutil
 import uuid
 from typing import List
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Depends
+from sqlalchemy import create_engine, Column, Integer, String
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
 from pydantic import BaseModel
 from PyPDF2 import PdfReader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -22,6 +25,29 @@ if GOOGLE_API_KEY is None:
 
 # Initialize FastAPI
 app = FastAPI()
+
+# ---------- Database Setup ----------
+DATABASE_URL = "sqlite:///./employee.db"
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+class Employee(Base):
+    __tablename__ = "employees"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, index=True)
+    phoneNumber = Column(String, unique=True, index=True)
+    type = Column(String, index=True)
+    role = Column(String, index=True)
+
+Base.metadata.create_all(bind=engine)
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 # Store uploaded files
 UPLOAD_DIR = "uploaded_files"
@@ -108,16 +134,86 @@ async def upload_files(files: List[UploadFile] = File(...)):
 class QueryRequest(BaseModel):
     question: str
 
+def extract_answer(response):
+    """Extract only the answer from the response"""
+    return response.get("answer","No answer found.")
+
 @app.post("/query")
 async def query_document(data: QueryRequest):
     """Query without conversation memory (stateless query)."""
     chain = get_conversational_chain(with_memory=False)
     response = chain.invoke({"question": data.question,"chat_history": []})
-    return {"response": response}
+    return {"answer": extract_answer(response)}
 
 @app.post("/chat")
 async def chat_with_memory(data: QueryRequest):
     """Chat with memory (stateful conversation)."""
     chain = get_conversational_chain(with_memory=True)
     response = chain.invoke({"question": data.question, "chat_history": []})
-    return {"response": response}
+    return {"answer": extract_answer(response)}
+
+# ---------- Employee CRUD APIs ----------
+class EmployeeCreate(BaseModel):
+    name: str
+    phoneNumber: str
+    type: str
+    role: str  # Added role since it was used in Employee model
+
+class EmployeesCreate(BaseModel):
+    employees: List[EmployeeCreate]
+    class Config:
+        orm_mode = True
+
+@app.post("/employees/")
+def create_employees(employees_data: EmployeesCreate, db: Session = Depends(get_db)):
+    print(employees_data.dict())
+    employees_list = [
+        Employee(
+            name=emp.name,
+            phoneNumber=emp.phoneNumber,
+            type=emp.type,
+            role=emp.role
+        ) 
+        for emp in employees_data.employees  # Corrected reference
+    ]
+    
+    db.add_all(employees_list)
+    db.commit()
+    
+    return {"message": f"{len(employees_list)} employees added successfully"}
+
+
+@app.get("/employees/search/")
+def search_employee_by_phone(phoneNumber: str, db: Session = Depends(get_db)):
+    employee = db.query(Employee).filter(Employee.phoneNumber == phoneNumber).first()
+    if not employee:
+        raise HTTPException(status_code=404, detail="Employee not found")
+    return employee
+
+@app.get("/employees/{employee_id}")
+def read_employee(employee_id: int, db: Session = Depends(get_db)):
+    employee = db.query(Employee).filter(Employee.id == employee_id).first()
+    if not employee:
+        raise HTTPException(status_code=404, detail="Employee not found")
+    return employee
+
+@app.put("/employees/{employee_id}")
+def update_employee(employee_id: int, employee: EmployeeCreate, db: Session = Depends(get_db)):
+    db_employee = db.query(Employee).filter(Employee.id == employee_id).first()
+    if not db_employee:
+        raise HTTPException(status_code=404, detail="Employee not found")
+    db_employee.name = employee.name
+    db_employee.phoneNumber = employee.phoneNumber
+    db_employee.type = employee.type
+    db.commit()
+    db.refresh(db_employee)
+    return db_employee
+
+@app.delete("/employees/{employee_id}")
+def delete_employee(employee_id: int, db: Session = Depends(get_db)):
+    db_employee = db.query(Employee).filter(Employee.id == employee_id).first()
+    if not db_employee:
+        raise HTTPException(status_code=404, detail="Employee not found")
+    db.delete(db_employee)
+    db.commit()
+    return {"message": "Employee deleted successfully"}
