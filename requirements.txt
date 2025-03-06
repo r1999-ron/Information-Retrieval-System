@@ -13,3 +13,4 @@ faiss-cpu
 streamlit
 tenacity
 sentence-transformers
+python-multipart
