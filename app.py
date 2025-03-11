@@ -4,7 +4,7 @@ import uuid
 from typing import List
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends
 from fastapi.responses import JSONResponse
-from sqlalchemy import create_engine, Column, Integer, String
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, ForeignKey, Date, Enum
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker,declarative_base
 from pydantic import BaseModel
@@ -21,10 +21,15 @@ import asyncio
 from sqlalchemy.future import select
 from sqlalchemy.exc import IntegrityError
 from langchain.schema import Document
-
+from fastapi.security import OAuth2PasswordBearer
+from datetime import datetime, timedelta, date
+import bcrypt
+import jwt
 # Load environment variables
 load_dotenv()
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+SECRET_KEY = os.getenv("SECRET_KEY")
+ALGORITHM = "HS256"
 if not GOOGLE_API_KEY:
     raise ValueError("GOOGLE_API_KEY is not set. Please check your environment variables.")
 
@@ -186,6 +191,18 @@ async def query_document(data: QueryRequest):
 async def chat_with_memory(data: QueryRequest):
     return {"answer": extract_answer(get_conversational_chain(with_memory=True).invoke(vars(data)))}
 
+class Attendance(Base):
+    __tablename__ = "attendance"
+    id = Column(Integer, primary_key=True, index=True)
+    employeeId = Column(String, ForeignKey("employees.id"), nullable=False)
+    date = Column(Date, default=datetime.utcnow)
+    status = Column(Enum("Present", "Leave", name="attendance_status"), nullable=False)
+
+class AttendanceCreate(BaseModel):
+    employeeId: str
+    status: str
+    date: date
+
 # Employee CRUD APIs
 class EmployeeCreate(BaseModel):
     name: str
@@ -275,6 +292,187 @@ async def delete_employee(employee_id: int, db: AsyncSession = Depends(get_db)):
     await db.delete(db_employee)
     await db.commit()
     return {"message": f"Employee with id {employee_id} deleted successfully"}
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+
+# Token Blacklist for Logout
+BLACKLISTED_TOKENS = set()
+
+class User(Base):
+    __tablename__ = "users"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String, unique=True, index=True, nullable=False)
+    email = Column(String, unique=True, index=True, nullable=False)
+    password_hash = Column(String, nullable=False)
+    is_active = Column(Boolean, default=True)
+
+    def verify_password(self, password: str) -> bool:
+        return bcrypt.checkpw(password.encode("utf-8"), self.password_hash.encode("utf-8"))
+
+# Create Database Tables
+async def init_db():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+# Password Hashing
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+# JWT Token Generation
+def create_access_token(user_id: int, expires_delta: timedelta = timedelta(hours=1)) -> str:
+    expire = datetime.utcnow() + expires_delta
+    payload = {"sub": str(user_id), "exp": expire}
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+# JWT Token Decoding & Validation
+def decode_access_token(token: str):
+    if token in BLACKLISTED_TOKENS:
+        raise HTTPException(status_code=401, detail="Token has been logged out")
+    
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        print(f"Decoded Payload: {payload}") 
+        return payload.get("sub")
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+# Pydantic Models
+class UserSignup(BaseModel):
+    username: str
+    email: str
+    password: str
+
+class UserLogin(BaseModel):
+    email: str
+    password: str
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str
+
+class LeaveRequest(BaseModel):
+    employee_id: str
+    date: date
+
+# Signup Endpoint
+@app.post("/signup/")
+async def signup(user: UserSignup, db: AsyncSession = Depends(get_db)):
+    # Check if user already exists
+    existing_user = await db.execute(select(User).filter(User.email == user.email))
+    if existing_user.scalars().first():
+        raise HTTPException(status_code=400, detail="User already exists")
+
+    # Create new user
+    new_user = User(
+        username=user.username,
+        email=user.email,
+        password_hash=hash_password(user.password)
+    )
+    db.add(new_user)
+    await db.commit()
+    return {"message": "User registered successfully"}
+
+# Login Endpoint
+@app.post("/login/", response_model=TokenResponse)
+async def login(user: UserLogin, db: AsyncSession = Depends(get_db)):
+    # Find user by email
+    result = await db.execute(select(User).filter(User.email == user.email))
+    db_user = result.scalars().first()
+
+    # Verify user credentials
+    if not db_user or not db_user.verify_password(user.password):
+        raise HTTPException(status_code=400, detail="Invalid credentials")
+
+    # Generate JWT token
+    access_token = create_access_token(user_id=db_user.id)
+    return {"access_token": access_token, "token_type": "bearer"}
+
+# Logout Endpoint
+@app.post("/logout/")
+async def logout(token: str = Depends(oauth2_scheme)):
+    BLACKLISTED_TOKENS.add(token)
+    return {"message": "Logged out successfully"}
+
+# Protected Route (Requires Authentication)
+async def get_current_user(token: str = Depends(oauth2_scheme), db: AsyncSession = Depends(get_db)):
+    user_id = decode_access_token(token)
+    print(f"Extracted User ID: {user_id}") 
+    result = await db.execute(select(User).filter(User.id == user_id))
+    user = result.scalars().first()
+    
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    return user
+
+@app.get("/protected/")
+async def protected_route(current_user: User = Depends(get_current_user)):
+    return {"message": f"Hello {current_user.username}, you have access!"}
+
+@app.post("/mark-attendance/")
+async def mark_attendance(employee_id: str, status: str, date: date, db: AsyncSession = Depends(get_db)):
+    """Mark attendance for a given employee on a specific date."""
+    
+    # Check if attendance is already marked for this date
+    existing_attendance = await db.execute(
+        select(Attendance).where(
+            Attendance.employeeId == employee_id,
+            Attendance.date == date
+        )
+    )
+    existing_attendance = existing_attendance.scalars().first()
+
+    if existing_attendance:
+        return {"error": "Attendance already marked for this date"}
+
+    # Save new attendance record
+    new_attendance = Attendance(
+        employeeId=employee_id,
+        status=status,
+        date=date
+    )
+    db.add(new_attendance)
+    await db.commit()
+    return {"message": "Attendance marked successfully"}
+
+@app.get("/attendance/")
+async def get_attendance(employee_id: str, db: AsyncSession = Depends(get_db)):
+    """Retrieve attendance records for an employee."""
+    result = await db.execute(select(Attendance).filter(Attendance.employeeId == employee_id))
+    return result.scalars().all()
+
+
+@app.post("/apply-leave/")
+async def apply_leave(employee_id: str, date: date, db: AsyncSession = Depends(get_db)):
+    """Apply for leave, ensuring the employee has not already marked attendance as 'Present'."""
+    
+    attendance_record = await db.execute(
+        select(Attendance).where(
+            Attendance.employeeId == employee_id,
+            Attendance.date == date
+        )
+    )
+    attendance_record = attendance_record.scalars().first()
+
+    if attendance_record:
+        if attendance_record.status == "Present":
+            return {"error": "Cannot apply for leave. Attendance is already marked as Present."}
+        elif attendance_record.status == "Leave":
+            return {"error": "Leave already applied for this date."}
+
+    # If no conflicting record exists, apply leave
+    new_leave = Attendance(
+        employeeId=employee_id,
+        status="Leave",
+        date=date
+    )
+    db.add(new_leave)
+    await db.commit()
+    
+    return {"message": "Leave applied successfully"}
+
 
 @app.get("/")
 def read_root():

@@ -16,3 +16,5 @@ sentence-transformers
 python-multipart
 greenlet
 aiosqlite
+pyjwt
+bcrypt
