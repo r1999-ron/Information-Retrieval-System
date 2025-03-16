@@ -25,6 +25,7 @@ from fastapi.security import OAuth2PasswordBearer
 from datetime import datetime, timedelta, date
 import bcrypt
 import jwt
+import logging
 # Load environment variables
 load_dotenv()
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
@@ -32,6 +33,10 @@ SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = "HS256"
 if not GOOGLE_API_KEY:
     raise ValueError("GOOGLE_API_KEY is not set. Please check your environment variables.")
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Initialize FastAPI
 app = FastAPI()
@@ -105,13 +110,6 @@ def split_text_into_chunks(text: str) -> List[str]:
 
 async def process_file(file: UploadFile) -> List[str]:
     """Handles file saving, text extraction, and chunking."""
-    # file_size = 0
-    # temp_path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4()}_{file.filename}")
-
-    # with open(temp_path, "wb") as buffer:
-    #     while chunk := await file.read(1024 * 1024):  # Read in 1MB chunks
-    #         file_size += len(chunk)
-    #         buffer.write(chunk)
     if file.size > MAX_FILE_SIZE_MB * 1024 * 1024:
         raise HTTPException(status_code=400, detail=f"File {file.filename} exceeds {MAX_FILE_SIZE_MB}MB limit.")
 
@@ -213,7 +211,7 @@ class EmployeeCreate(BaseModel):
 class EmployeesCreate(BaseModel):
     employees: List[EmployeeCreate]
     class Config:
-        orm_mode = True
+        from_attributes = True
 
 @app.post("/add_employee/")
 async def create_employees(employees_data: EmployeesCreate, db: AsyncSession = Depends(get_db)):
@@ -320,9 +318,14 @@ def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
 # JWT Token Generation
-def create_access_token(user_id: int, expires_delta: timedelta = timedelta(hours=1)) -> str:
+def create_access_token(user_id: int, expires_delta: timedelta = timedelta(minutes=15)) -> str:
     expire = datetime.utcnow() + expires_delta
     payload = {"sub": str(user_id), "exp": expire}
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+def create_refresh_token(user_id: int, expires_delta: timedelta = timedelta(days=7)) -> str:
+    expire = datetime.utcnow() + expires_delta
+    payload = {"sub": str(user_id), "exp": expire, "type": "refresh"}
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
 # JWT Token Decoding & Validation
@@ -357,6 +360,9 @@ class LeaveRequest(BaseModel):
     employee_id: str
     date: date
 
+class RefreshTokenRequest(BaseModel):
+    token: str
+
 # Signup Endpoint
 @app.post("/signup/")
 async def signup(user: UserSignup, db: AsyncSession = Depends(get_db)):
@@ -388,12 +394,30 @@ async def login(user: UserLogin, db: AsyncSession = Depends(get_db)):
 
     # Generate JWT token
     access_token = create_access_token(user_id=db_user.id)
-    return {"access_token": access_token, "token_type": "bearer"}
+    refresh_token = create_refresh_token(user_id=db_user.id)
+    return {"access_token": access_token, "refresh_token": refresh_token, "token_type": "bearer"}
+
+@app.post("/refresh-token/", response_model=TokenResponse)
+async def refresh_token(data: RefreshTokenRequest):
+    try:
+        payload = jwt.decode(data.refresh_token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id = payload.get("sub")
+        token_type = payload.get("type")
+        if token_type != "refresh":
+            raise HTTPException(status_code=401, detail="Invalid token type")
+        access_token = create_access_token(user_id=user_id)
+        return {"access_token": access_token, "token_type": "bearer"}
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Refresh token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
 
 # Logout Endpoint
 @app.post("/logout/")
 async def logout(token: str = Depends(oauth2_scheme)):
     BLACKLISTED_TOKENS.add(token)
+    if refresh_token:
+        BLACKLISTED_TOKENS.add(refresh_token)
     return {"message": "Logged out successfully"}
 
 # Protected Route (Requires Authentication)
@@ -472,7 +496,6 @@ async def apply_leave(employee_id: str, date: date, db: AsyncSession = Depends(g
     await db.commit()
     
     return {"message": "Leave applied successfully"}
-
 
 @app.get("/")
 def read_root():
