@@ -93,15 +93,24 @@ async def save_file(file: UploadFile) -> str:
         raise HTTPException(status_code=500, detail=f"Error saving file: {str(e)}")
     return file_path
 
-def extract_text_from_pdf(file_path: str) -> str:
-    """Extracts text from a PDF file."""
-    text = ""
-    try:
-        pdf_reader = PdfReader(file_path)
-        text = "\n".join(page.extract_text() or "" for page in pdf_reader.pages)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error extracting text: {str(e)}")
-    return text
+def extract_text_from_file(file_path: str) -> str:
+    """Extracts text from a file (PDF or TXT)."""
+    if file_path.endswith(".pdf"):
+        text = ""
+        try:
+            pdf_reader = PdfReader(file_path)
+            text = "\n".join(page.extract_text() or "" for page in pdf_reader.pages)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error extracting text from PDF: {str(e)}")
+        return text
+    elif file_path.endswith(".txt"):
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                return f.read()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error reading TXT file: {str(e)}")
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported file type. Only PDF and TXT files are allowed.")
 
 def split_text_into_chunks(text: str) -> List[str]:
     """Splits text into smaller chunks."""
@@ -114,8 +123,14 @@ async def process_file(file: UploadFile) -> List[str]:
         raise HTTPException(status_code=400, detail=f"File {file.filename} exceeds {MAX_FILE_SIZE_MB}MB limit.")
 
     file_path = await save_file(file)
-    text = extract_text_from_pdf(file_path)
-    os.remove(file_path)
+    text = ""
+    try:
+        text = extract_text_from_file(file_path)
+    except HTTPException as e:
+        raise e
+    finally:
+        if os.path.exists(file_path):
+            os.remove(file_path)
     return split_text_into_chunks(text)
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10), retry=retry_if_exception_type(APIRateLimitError))
@@ -183,7 +198,7 @@ def extract_answer(response):
 
 @app.post("/query")
 async def query_document(data: QueryRequest):
-    return {"answer": extract_answer(get_conversational_chain(with_memory=False).invoke(vars(data)))}
+    return {"answer": extract_answer(get_conversational_chain(with_memory=True).invoke(vars(data)))}
 
 @app.post("/chat")
 async def chat_with_memory(data: QueryRequest):
