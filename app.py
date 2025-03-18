@@ -2,7 +2,7 @@ import os
 import shutil
 import uuid
 from typing import List
-from fastapi import FastAPI, File, UploadFile, HTTPException, Depends
+from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Header
 from fastapi.responses import JSONResponse
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, ForeignKey, Date, Enum
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
@@ -40,6 +40,11 @@ logger = logging.getLogger(__name__)
 
 # Initialize FastAPI
 app = FastAPI()
+
+VALID_TOKENS = {
+    "abcdef": "upload",
+    "qwerty": "query"
+}
 
 # Database Setup
 DATABASE_URL = "sqlite+aiosqlite:///./employee.db"
@@ -152,18 +157,15 @@ def get_conversational_chain(with_memory: bool = True):
 
 # File Upload API
 @app.post("/upload")
-async def upload_files(files: List[UploadFile] = File(...)):
+async def upload_files(files: List[UploadFile] = File(...), token : str = Header(None)):
+
+    if token not in VALID_TOKENS or VALID_TOKENS[token] != "upload":
+        raise HTTPException(status_code=404, detail="Unauthorized")
+    
     global vector_store
     all_text_chunks = await asyncio.gather(*[process_file(file) for file in files])
     all_text_chunks = [chunk for chunks in all_text_chunks for chunk in chunks]
     
-    new_vector_store = FAISS.from_texts(all_text_chunks, embedding=embeddings_model)
-
-    # Merge with existing FAISS index if exists
-    if vector_store is None:
-        vector_store = new_vector_store
-    else:
-        vector_store.merge_from(new_vector_store)
     # Save the updated vector store
     save_faiss_index(all_text_chunks)  # Persist the FAISS index to disk
     return {"message": f"{len(files)} files uploaded and processed successfully."}
@@ -173,6 +175,12 @@ def save_faiss_index(all_text_chunks):
     documents = [Document(page_content=text) for text in all_text_chunks]
     global vector_store
     vector_store = FAISS.from_documents(documents, embeddings_model)
+    if vector_store is None:
+        vector_store = FAISS.from_documents(documents, embeddings_model)
+    else:
+        new_vector_store = FAISS.from_documents(documents, embeddings_model)
+        vector_store.merge_from(new_vector_store)
+
     if vector_store:
         vector_store.save_local(FAISS_INDEX_PATH)
         print(f"FAISS index saved to {FAISS_INDEX_PATH}")
@@ -197,13 +205,11 @@ def extract_answer(response):
     return response.get("answer", "No answer found.")
 
 @app.post("/query")
-async def query_document(data: QueryRequest):
+async def query_document(data: QueryRequest, token: str = Header(None)):
+    if token not in VALID_TOKENS or VALID_TOKENS[token] not in ["upload", "query"]:
+        raise HTTPException(status_code=401, detail="Unauthorized: Invalid or missing token")
     return {"answer": extract_answer(get_conversational_chain(with_memory=True).invoke(vars(data)))}
-
-@app.post("/chat")
-async def chat_with_memory(data: QueryRequest):
-    return {"answer": extract_answer(get_conversational_chain(with_memory=True).invoke(vars(data)))}
-
+    
 class Attendance(Base):
     __tablename__ = "attendance"
     id = Column(Integer, primary_key=True, index=True)
