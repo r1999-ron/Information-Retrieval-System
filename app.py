@@ -26,6 +26,7 @@ from datetime import datetime, timedelta, date
 import bcrypt
 import jwt
 import logging
+import time
 # Load environment variables
 load_dotenv()
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
@@ -141,7 +142,7 @@ async def process_file(file: UploadFile) -> List[str]:
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10), retry=retry_if_exception_type(APIRateLimitError))
 def get_llm_with_retry():
     try:
-        return ChatGoogleGenerativeAI(model="models/gemini-1.5-flash", google_api_key=GOOGLE_API_KEY)
+        return ChatGoogleGenerativeAI(model="models/gemini-1.5-flash", google_api_key=GOOGLE_API_KEY, temperature=0.5)
     except Exception as e:
         if "rate_limit" in str(e).lower() or "quota exceeded" in str(e).lower():
             raise APIRateLimitError(f"Rate limit error: {e}")
@@ -151,50 +152,113 @@ def get_conversational_chain(with_memory: bool = True):
     global vector_store
     if vector_store is None:
         raise HTTPException(status_code=400, detail="No FAISS index loaded. Please upload documents first.")
+    # Log the size of the FAISS index
+    logger.info(f"Using FAISS index with {vector_store.index.ntotal} embeddings.")
     llm = get_llm_with_retry()
     memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True) if with_memory else None
-    return ConversationalRetrievalChain.from_llm(llm=llm, retriever=vector_store.as_retriever(), memory=memory)
+    # Use the entire FAISS index for retrieval
+    retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 10})
+    return ConversationalRetrievalChain.from_llm(llm=llm, retriever=retriever, memory=memory)
 
 # File Upload API
 @app.post("/upload")
-async def upload_files(files: List[UploadFile] = File(...), token : str = Header(None)):
-
+async def upload_files(files: List[UploadFile] = File(...), token: str = Header(None)):
+    start_time = time.time()
+    
     if token not in VALID_TOKENS or VALID_TOKENS[token] != "upload":
         raise HTTPException(status_code=404, detail="Unauthorized")
-    
+
     global vector_store
-    all_text_chunks = await asyncio.gather(*[process_file(file) for file in files])
-    all_text_chunks = [chunk for chunks in all_text_chunks for chunk in chunks]
-    
-    # Save the updated vector store
-    save_faiss_index(all_text_chunks)  # Persist the FAISS index to disk
+    all_text_chunks = []
+    file_processing_times = []
+
+    for file in files:
+        file_start_time = time.time()
+        try:
+            # Log file size
+            file_size_mb = file.size / (1024 * 1024)
+            logger.info(f"Processing file: {file.filename} (Size: {file_size_mb:.2f} MB)")
+
+            # Process the file
+            chunks = await process_file(file)
+            all_text_chunks.extend(chunks)
+
+            # Log processing time for this file
+            file_end_time = time.time()
+            file_processing_time = file_end_time - file_start_time
+            file_processing_times.append(file_processing_time)
+            logger.info(f"File {file.filename} processed in {file_processing_time:.2f} seconds.")
+
+        except Exception as e:
+            logger.error(f"Error processing file {file.filename}: {e}")
+            raise HTTPException(status_code=500, detail=f"Error processing file {file.filename}: {str(e)}")
+
+    # Log total file processing time
+    total_file_processing_time = time.time() - start_time
+    logger.info(f"Total file processing time: {total_file_processing_time:.2f} seconds.")
+
+    # Save the updated FAISS index
+    faiss_start_time = time.time()
+    save_faiss_index(all_text_chunks)
+    faiss_end_time = time.time()
+    faiss_indexing_time = faiss_end_time - faiss_start_time
+    logger.info(f"FAISS indexing completed in {faiss_indexing_time:.2f} seconds.")
+
+    # Log total upload and processing time
+    end_time = time.time()
+    total_time = end_time - start_time
+    logger.info(f"Upload and processing completed in {total_time:.2f} seconds.")
+
     return {"message": f"{len(files)} files uploaded and processed successfully."}
 
 def save_faiss_index(all_text_chunks):
-    """Save the FAISS index to disk."""
-    documents = [Document(page_content=text) for text in all_text_chunks]
+    """Save the FAISS index to disk, merging new embeddings with existing ones."""
     global vector_store
-    vector_store = FAISS.from_documents(documents, embeddings_model)
+
+    # Create documents from the new text chunks
+    documents = [Document(page_content=text) for text in all_text_chunks]
+
+    # Log the number of new documents being added
+    logger.info(f"Adding {len(documents)} new documents to the FAISS index.")
+
+    # If no existing vector store, create a new one
     if vector_store is None:
+        logger.info("No existing FAISS index found. Creating a new one.")
         vector_store = FAISS.from_documents(documents, embeddings_model)
     else:
+        # Log the size of the existing index
+        logger.info(f"Merging new embeddings with existing FAISS index (size: {vector_store.index.ntotal}).")
+        
+        # Create a new vector store from the new documents
         new_vector_store = FAISS.from_documents(documents, embeddings_model)
+        
+        # Merge the new embeddings with the existing vector store
         vector_store.merge_from(new_vector_store)
 
+        # Log the size of the updated index
+        logger.info(f"Updated FAISS index size: {vector_store.index.ntotal}.")
+
+    # Save the updated vector store to disk
     if vector_store:
         vector_store.save_local(FAISS_INDEX_PATH)
-        print(f"FAISS index saved to {FAISS_INDEX_PATH}")
+        logger.info(f"FAISS index saved to {FAISS_INDEX_PATH}.")
     else:
-        print("Vector store creation failed. FAISS index not saved.")
+        logger.error("Vector store creation failed. FAISS index not saved.")
 
 def load_faiss_index():
-    """Load the FAISS index from disk."""
+    """Load the FAISS index from disk if it exists, otherwise initialize an empty index."""
     global vector_store
+
     if os.path.exists(FAISS_INDEX_PATH):
-        vector_store = FAISS.load_local(FAISS_INDEX_PATH, embeddings_model, allow_dangerous_deserialization=True)
-        print(f"FAISS index loaded from {FAISS_INDEX_PATH}")
+        try:
+            vector_store = FAISS.load_local(FAISS_INDEX_PATH, embeddings_model, allow_dangerous_deserialization=True)
+            logger.info(f"FAISS index loaded from {FAISS_INDEX_PATH} (size: {vector_store.index.ntotal}).")
+        except Exception as e:
+            logger.error(f"Failed to load FAISS index: {e}")
+            vector_store = None
     else:
-        print(f"No FAISS index found, starting fresh.")
+        logger.warning(f"No FAISS index found at {FAISS_INDEX_PATH}, starting fresh.")
+        vector_store = None
 
 # Query Models
 class QueryRequest(BaseModel):
@@ -208,8 +272,13 @@ def extract_answer(response):
 async def query_document(data: QueryRequest, token: str = Header(None)):
     if token not in VALID_TOKENS or VALID_TOKENS[token] not in ["upload", "query"]:
         raise HTTPException(status_code=401, detail="Unauthorized: Invalid or missing token")
-    return {"answer": extract_answer(get_conversational_chain(with_memory=True).invoke(vars(data)))}
+    # Clear memory before processing the query
+    memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+    chain = get_conversational_chain(with_memory=True)
     
+    response = chain.invoke(vars(data))
+    return {"answer": extract_answer(response)}
+
 class Attendance(Base):
     __tablename__ = "attendance"
     id = Column(Integer, primary_key=True, index=True)
